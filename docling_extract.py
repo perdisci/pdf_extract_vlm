@@ -5,17 +5,83 @@ Usage:
   python3 docling_extract.py -f /path/to/input_doc.pdf -o /out/dir/path/
 
 Requirements:
-  pip install docling
+  pip install docling rapidocr-onnxruntime Pillow
 """
 
 import os
 import argparse
 import json
+import re
 from pathlib import Path
 
 from docling.datamodel.base_models import InputFormat
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling_core.types.doc import ImageRefMode
+
+from rapidocr import RapidOCR
+
+# Initialize RapidOCR engine once
+engine = RapidOCR()
+
+
+def extract_ocr_from_image_file(image_path):
+    """
+    Extracts text from an image file using RapidOCR.
+    """
+    try:
+        # RapidOCR returns a RapidOCROutput object in newer versions
+        output = engine(str(image_path))
+        if output and output.txts:
+            # output.txts is a tuple of detected text segments
+            return "\n".join(output.txts)
+    except Exception:
+        return None
+    return None
+
+
+def process_ocr_for_md(md_text, output_path, ocr_map):
+    """
+    Finds image links in markdown and appends an invisible comment with OCR text.
+    """
+    img_regex = r"!\[(.*?)\]\((.*?)\)"
+    md_content = md_text
+    
+    matches = re.findall(img_regex, md_text)
+    for alt_text, img_rel_path in matches:
+        ocr_text = ocr_map.get(img_rel_path)
+        if ocr_text:
+            # Escape --> to avoid breaking the comment
+            safe_ocr_text = ocr_text.replace("-->", "-- >")
+            comment = f" <!-- OCR: {safe_ocr_text} -->"
+            target = f"![{alt_text}]({img_rel_path})"
+            md_content = md_content.replace(target, target + comment, 1)
+                
+    return md_content
+
+
+def process_ocr_for_txt(md_text, output_path, ocr_map):
+    """
+    Finds image links in markdown and replaces them with OCR text for the .txt version.
+    """
+    img_regex = r"!\[(.*?)\]\((.*?)\)"
+    txt_content = md_text
+    
+    matches = re.findall(img_regex, md_text)
+    for alt_text, img_rel_path in matches:
+        ocr_text = ocr_map.get(img_rel_path)
+        
+        replacement = f"\n\n[START_OCR_TEXT_FROM_IMAGE: {img_rel_path}]\n"
+        if ocr_text:
+            replacement += ocr_text
+        else:
+            replacement += "[No text detected or OCR failed]"
+        replacement += "\n[END_OCR_TEXT_FROM_IMAGE]\n\n"
+        
+        target = f"![{alt_text}]({img_rel_path})"
+        txt_content = txt_content.replace(target, replacement, 1)
+            
+    return txt_content
 
 
 def extract_from_pdf(pdf_path, output_path):
@@ -48,28 +114,49 @@ def extract_from_pdf(pdf_path, output_path):
     doc = result.document
 
     base_name = pdf_path.stem
-    
-    # 1. Save as JSON
-    with open(output_path / f"{base_name}.json", "w", encoding="utf-8") as f:
-        json.dump(doc.export_to_dict(), f, indent=2)
-
-    # 2. Save as Markdown (Docling's primary output)
-    with open(output_path / f"{base_name}.md", "w", encoding="utf-8") as f:
-        f.write(doc.export_to_markdown())
-
-    # 3. Save as Plain Text
-    with open(output_path / f"{base_name}.txt", "w", encoding="utf-8") as f:
-        f.write(doc.export_to_markdown()) # Markdown is a good proxy for text with structure
-
-    # 4. Extract and save images
     out_img_path = output_path / f"{base_name}_images"
     out_img_path.mkdir(exist_ok=True)
-    
+
+    # 1. Manually save images and update URIs so the exporter can link them
+    # Note: doc.pictures is a convenient way to access all PictureItems
     for i, picture in enumerate(doc.pictures):
-        # In Docling v2, use get_image(doc) to retrieve the PIL image
         pil_img = picture.get_image(doc)
         img_filename = f"image_{i}.png"
         pil_img.save(out_img_path / img_filename)
+        
+        # Set the URI for the referenced image mode
+        if picture.image:
+            picture.image.uri = f"{base_name}_images/{img_filename}"
+
+    # 2. Save as JSON
+    with open(output_path / f"{base_name}.json", "w", encoding="utf-8") as f:
+        json.dump(doc.export_to_dict(), f, indent=2)
+
+    # 3. Save as Markdown (Docling's primary output) with image references
+    # Since we set the URIs manually, REFERENCED mode will use them.
+    markdown_content = doc.export_to_markdown(image_mode=ImageRefMode.REFERENCED)
+
+    # Pre-calculate OCR for all images to avoid redundant processing
+    ocr_map = {}
+    img_regex = r"!\[(.*?)\]\((.*?)\)"
+    matches = re.findall(img_regex, markdown_content)
+    for _, img_rel_path in matches:
+        if img_rel_path not in ocr_map:
+            full_path = output_path / img_rel_path
+            if full_path.exists():
+                print(f"Performing OCR on {img_rel_path}...")
+                ocr_map[img_rel_path] = extract_ocr_from_image_file(full_path)
+
+    # Save the Markdown version with invisible OCR comments
+    md_with_ocr = process_ocr_for_md(markdown_content, output_path, ocr_map)
+    with open(output_path / f"{base_name}.md", "w", encoding="utf-8") as f:
+        f.write(md_with_ocr)
+
+    # 4. Save as Plain Text with OCR'd image text in place
+    print("Generating the text version...")
+    txt_text = process_ocr_for_txt(markdown_content, output_path, ocr_map)
+    with open(output_path / f"{base_name}.txt", "w", encoding="utf-8") as f:
+        f.write(txt_text)
 
     # 5. Extract and save tables as CSV
     out_tab_path = output_path / f"{base_name}_tables"

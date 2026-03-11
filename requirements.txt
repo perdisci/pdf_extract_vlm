@@ -1,0 +1,7 @@
+pymupdf
+pymupdf4llm
+pymupdf-layout
+rapidocr-onnxruntime
+Pillow
+docling
+pandas

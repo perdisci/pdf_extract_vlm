@@ -6,7 +6,7 @@ Usage:
   python3 pdf_extract.py -f /path/to/input_doc.pdf -o /out/dir/path/
 
 Requirements:
-  pip install pymupdf pymupdf4llm pymupdf-layout pytesseract Pillow
+  pip install pymupdf pymupdf4llm pymupdf-layout rapidocr-onnxruntime Pillow
 """
 
 import os
@@ -19,37 +19,35 @@ import pymupdf
 import pymupdf4llm
 from pathlib import Path
 
-import io
-import base64
-import pytesseract
-from PIL import Image
-from PIL import ImageEnhance
+from rapidocr import RapidOCR
+
+# Initialize RapidOCR engine once
+engine = RapidOCR()
 
 
 def extract_ocr_from_image_file(image_path):
     """
-    Extracts text from an image file using OCR.
+    Extracts text from an image file using RapidOCR.
     """
     try:
-        image = Image.open(image_path).convert("L")  # Convert to grayscale
-        enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(1.5)  # Increase contrast
-
-        text = pytesseract.image_to_string(
-            image, lang="eng+spa+por+rus+ita+fra+ukr+chi_sim+kor+jpn"
-        )
-        if text:
-            return text.strip()
+        # RapidOCR returns a RapidOCROutput object in newer versions
+        output = engine(str(image_path))
+        if output and output.txts:
+            # output.txts is a tuple of detected text segments
+            return "\n".join(output.txts)
     except Exception:
         return None
     return None
 
 
-def process_ocr_for_txt(md_text, output_path):
+def process_ocr_content(md_text, output_path):
     """
-    Finds image links in markdown and replaces them with OCR text for the .txt version.
+    Finds image links in markdown, performs OCR, and returns:
+    1. MD text with OCR in invisible comments after image links.
+    2. TXT text with OCR in place of image links.
     """
     img_regex = r"!\[(.*?)\]\((.*?)\)"
+    md_content = md_text
     txt_content = md_text
     
     matches = re.findall(img_regex, md_text)
@@ -59,6 +57,19 @@ def process_ocr_for_txt(md_text, output_path):
             print(f"Performing OCR on {img_rel_path}...")
             ocr_text = extract_ocr_from_image_file(full_path)
             
+            target = f"![{alt_text}]({img_rel_path})"
+            
+            # Update MD content with invisible comment
+            if ocr_text:
+                # Escape --> to avoid breaking the HTML comment
+                safe_ocr = ocr_text.replace("-->", "-- >")
+                md_comment = f" <!-- OCR_TEXT: {safe_ocr} -->"
+            else:
+                md_comment = " <!-- OCR failed or no text detected -->"
+            
+            md_content = md_content.replace(target, target + md_comment, 1)
+            
+            # Update TXT content with visible OCR block
             replacement = f"\n\n[START_OCR_TEXT_FROM_IMAGE: {img_rel_path}]\n"
             if ocr_text:
                 replacement += ocr_text
@@ -66,10 +77,9 @@ def process_ocr_for_txt(md_text, output_path):
                 replacement += "[No text detected or OCR failed]"
             replacement += "\n[END_OCR_TEXT_FROM_IMAGE]\n\n"
             
-            target = f"![{alt_text}]({img_rel_path})"
             txt_content = txt_content.replace(target, replacement, 1)
             
-    return txt_content
+    return md_content, txt_content
 
 
 def extract_from_pdf(pdf_path, output_path):
@@ -107,13 +117,15 @@ def extract_from_pdf(pdf_path, output_path):
     finally:
         os.chdir(original_cwd)
     
-    # Save the Markdown version (already contains relative image links)
-    with open(output_path / f"{base_name}.md", "w", encoding="utf-8") as f:
-        f.write(md_text)
+    # 2. Process images for OCR (enriched MD and TXT versions)
+    print("Processing images for OCR...")
+    enriched_md, txt_text = process_ocr_content(md_text, output_path)
 
-    # 2. Generate .txt version with OCR'd image text in place
-    print("Processing images for OCR in the text version...")
-    txt_text = process_ocr_for_txt(md_text, output_path)
+    # Save the Markdown version (contains relative image links + OCR comments)
+    with open(output_path / f"{base_name}.md", "w", encoding="utf-8") as f:
+        f.write(enriched_md)
+
+    # Save the .txt version with OCR'd image text in place
     with open(output_path / f"{base_name}.txt", "w", encoding="utf-8") as f:
         f.write(txt_text)
 
