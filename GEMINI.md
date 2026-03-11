@@ -1,8 +1,8 @@
 # PDF Extract Project Overview
 
 This project provides Python scripts to extract text, images, and tables from PDF documents. It includes two implementation options:
-1. `pdf_extract.py`: Modernized script using PyMuPDF, `pymupdf4llm`, and `pymupdf-layout` for advanced layout analysis, with `RapidOCR` for image text extraction.
-2. `docling_extract.py`: Uses IBM's Docling for advanced document conversion and analysis, also integrated with `RapidOCR` for consistent image text extraction.
+1. `pdf_extract.py`: Modernized script using PyMuPDF, `pymupdf4llm`, and `pymupdf-layout` for advanced layout analysis, with a **Hybrid OCR** pipeline (Tesseract OSD + RapidOCR) for image text extraction.
+2. `docling_extract.py`: Uses IBM's Docling for advanced document conversion and analysis, also integrated with the **Hybrid OCR** pipeline for consistent image text extraction.
 
 ## Technologies
 
@@ -10,7 +10,7 @@ This project provides Python scripts to extract text, images, and tables from PD
 - **PyMuPDF (fitz):** For PDF parsing and extraction.
 - **pymupdf4llm:** For layout-aware Markdown extraction in `pdf_extract.py`.
 - **pymupdf-layout:** Integrated layout analysis for PyMuPDF.
-- **RapidOCR:** For fast and accurate OCR capabilities in both `pdf_extract.py` and `docling_extract.py`.
+- **Hybrid OCR Pipeline:** Combines **Tesseract** (for script and orientation detection) and **RapidOCR** (for high-fidelity text extraction) to handle multi-language documents and rotated images effectively.
 - **Pillow (PIL):** For image processing.
 - **Docling:** For comprehensive document conversion in `docling_extract.py`.
 - **Pandas:** For table processing in `docling_extract.py`.

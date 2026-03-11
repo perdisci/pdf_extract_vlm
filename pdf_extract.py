@@ -6,7 +6,7 @@ Usage:
   python3 pdf_extract.py -f /path/to/input_doc.pdf -o /out/dir/path/
 
 Requirements:
-  pip install pymupdf pymupdf4llm pymupdf-layout rapidocr-onnxruntime Pillow
+  pip install pymupdf pymupdf4llm pymupdf-layout rapidocr-onnxruntime pytesseract Pillow
 """
 
 import os
@@ -19,25 +19,83 @@ import pymupdf
 import pymupdf4llm
 from pathlib import Path
 
+import pytesseract
+from PIL import Image
 from rapidocr import RapidOCR
+from rapidocr.utils.typings import LangRec
 
-# Initialize RapidOCR engine once
-engine = RapidOCR()
+class HybridOCR:
+    def __init__(self):
+        self.engines = {}
+        # Mapping from Tesseract Script to RapidOCR rec_lang enum
+        self.script_to_lang = {
+            "Latin": LangRec.EN,
+            "Cyrillic": LangRec.CYRILLIC,
+            "Han": LangRec.CH,
+            "Japanese": LangRec.JAPAN,
+            "Korean": LangRec.KOREAN,
+            "Arabic": LangRec.ARABIC,
+            "Devanagari": LangRec.DEVANAGARI,
+        }
+
+    def get_engine(self, lang=LangRec.CH):
+        if lang not in self.engines:
+            # rec_lang is passed via nested key "Rec.lang_type"
+            # use_cls is under "Global.use_cls"
+            self.engines[lang] = RapidOCR(params={
+                "Rec.lang_type": lang, 
+                "Global.use_cls": True
+            })
+        return self.engines[lang]
+
+    def extract_text(self, image_path):
+        try:
+            # Phase 1: Routing & Orientation Detection
+            osd = pytesseract.image_to_osd(str(image_path))
+            
+            # Parse OSD output
+            osd_data = {}
+            for line in osd.splitlines():
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    osd_data[key.strip()] = value.strip()
+            
+            script = osd_data.get("Script", "Latin")
+            rotate = int(osd_data.get("Rotate", 0))
+            
+            # Phase 2: Logic - Map Script to RapidOCR model
+            rec_lang = self.script_to_lang.get(script, LangRec.EN)
+            
+            # Phase 3: Extraction
+            engine = self.get_engine(rec_lang)
+            
+            img = Image.open(image_path)
+            if rotate != 0:
+                img = img.rotate(-rotate, expand=True)
+            
+            output = engine(img)
+            if output and output.txts:
+                return "\n".join(output.txts)
+        except Exception:
+            # Fallback to default engine if OSD fails
+            try:
+                engine = self.get_engine(LangRec.CH)
+                output = engine(str(image_path))
+                if output and output.txts:
+                    return "\n".join(output.txts)
+            except:
+                return None
+        return None
+
+# Initialize HybridOCR engine once
+hybrid_ocr = HybridOCR()
 
 
 def extract_ocr_from_image_file(image_path):
     """
-    Extracts text from an image file using RapidOCR.
+    Extracts text from an image file using Hybrid OCR (Tesseract + RapidOCR).
     """
-    try:
-        # RapidOCR returns a RapidOCROutput object in newer versions
-        output = engine(str(image_path))
-        if output and output.txts:
-            # output.txts is a tuple of detected text segments
-            return "\n".join(output.txts)
-    except Exception:
-        return None
-    return None
+    return hybrid_ocr.extract_text(image_path)
 
 
 def process_ocr_content(md_text, output_path):

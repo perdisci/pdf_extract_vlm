@@ -2,6 +2,7 @@ pymupdf
 pymupdf4llm
 pymupdf-layout
 rapidocr-onnxruntime
+pytesseract
 Pillow
 docling
 pandas
