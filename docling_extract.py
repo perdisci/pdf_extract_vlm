@@ -35,7 +35,7 @@ def extract_from_pdf(pdf_path, output_path):
     pipeline_options.do_ocr = True  # Enable OCR for images
     pipeline_options.do_table_structure = True  # Enable table structure extraction
     pipeline_options.images_scale = 2.0  # Scale images for better quality
-    pipeline_options.generate_page_images = True # Generate page images if needed
+    pipeline_options.generate_picture_images = True # Required for image extraction in v2
 
     converter = DocumentConverter(
         format_options={
@@ -65,11 +65,11 @@ def extract_from_pdf(pdf_path, output_path):
     out_img_path = output_path / f"{base_name}_images"
     out_img_path.mkdir(exist_ok=True)
     
-    for i, image_element in enumerate(doc.images):
-        # Docling provides images as PIL Image objects
-        img = image_element.image
+    for i, picture in enumerate(doc.pictures):
+        # In Docling v2, use get_image(doc) to retrieve the PIL image
+        pil_img = picture.get_image(doc)
         img_filename = f"image_{i}.png"
-        img.save(out_img_path / img_filename)
+        pil_img.save(out_img_path / img_filename)
 
     # 5. Extract and save tables as CSV
     out_tab_path = output_path / f"{base_name}_tables"
