@@ -14,7 +14,6 @@ import json
 import re
 import time
 from pathlib import Path
-import logging
 
 from docling.datamodel.base_models import InputFormat
 from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -103,9 +102,9 @@ def extract_ocr_from_image_file(image_path):
     return hybrid_ocr.extract_text(image_path)
 
 
-def extract_ollama_from_image_file(image_path, model, host, timeout):
+def extract_ollama_from_image_file(image_path, model, host, timeout, retries=2):
     """
-    Extracts description and text from an image file using Ollama.
+    Extracts description and text from an image file using Ollama with retries.
     """
     client = Client(host=host, timeout=timeout)
 
@@ -125,20 +124,29 @@ def extract_ollama_from_image_file(image_path, model, host, timeout):
         **Format Constraints**: Start the response with a line containing `### Image Category: <label>`, where <label> must be chosen among the following: Company Logo, Application Screeshot, Web Page, Code Snippet, Code Analysis, Traffic Analysis, C2 Infrastructure, Phishing Message, Text Document, Flow Chart, System Diagram, Data Table, or Unknown.
         """
 
-    try:
-        response = client.generate(
-            model=model,
-            prompt=prompt_simple,
-            images=[image_path],
-            stream=False,
-            options={
-                "temperature": 0.1,
-            },
-        )
-        return response["response"]
-    except Exception as e:
-        print(f"Error querying Ollama for {image_path}: {e}")
-        return None
+    for attempt in range(retries + 1):
+        try:
+            response = client.generate(
+                model=model,
+                prompt=prompt_simple,
+                images=[image_path],
+                stream=False,
+                options={
+                    "temperature": 0.1,
+                },
+            )
+            return response["response"]
+        except Exception as e:
+            if attempt < retries:
+                print(
+                    f"\nWarning: Ollama query failed for {image_path.name} (attempt {attempt + 1}/{retries + 1}): {e}. Retrying in 2s..."
+                )
+                time.sleep(2)
+            else:
+                print(
+                    f"\nError: Ollama query failed after {retries + 1} attempts for {image_path.name}: {e}"
+                )
+                return None
 
 
 def process_image_text_for_md(md_text, output_path, image_text_map, mode="ocr"):
@@ -155,7 +163,7 @@ def process_image_text_for_md(md_text, output_path, image_text_map, mode="ocr"):
         if text:
             # Escape -- to avoid breaking the comment
             safe_text = text.replace("--", "- -")
-            comment = f" <!-- {label}: {safe_text} -->"
+            comment = f"\n<!-- {label}: {safe_text} -->\n"
             target = f"![{alt_text}]({img_rel_path})"
             md_content = md_content.replace(target, target + comment, 1)
 
@@ -193,7 +201,8 @@ def extract_from_pdf(
     mode="ocr",
     model=None,
     ollama_host="http://localhost:11434",
-    ollama_timeout=180,
+    ollama_timeout=300,
+    ollama_retries=2,
 ):
     """
     Extracts text, images, and tables from a single PDF document using Docling.
@@ -205,6 +214,7 @@ def extract_from_pdf(
         model: Ollama model name (if mode is 'ollama').
         ollama_host: Ollama host URL.
         ollama_timeout: Ollama API timeout in seconds.
+        ollama_retries: Number of Ollama API retries on failure.
     """
     pdf_path = Path(pdf_path)
     output_path = Path(output_path)
@@ -268,7 +278,7 @@ def extract_from_pdf(
                     )
                     start_time = time.time()
                     image_text_map[img_rel_path] = extract_ollama_from_image_file(
-                        full_path, model, ollama_host, ollama_timeout
+                        full_path, model, ollama_host, ollama_timeout, ollama_retries
                     )
                     elapsed_time = time.time() - start_time
                     print(f"done in {elapsed_time:.2f}s")
@@ -342,8 +352,14 @@ def parse_arguments():
     parser.add_argument(
         "--ollama-timeout",
         type=int,
-        default=180,
-        help="Ollama API timeout in seconds (default: 180).",
+        default=300,
+        help="Ollama API timeout in seconds (default: 300).",
+    )
+    parser.add_argument(
+        "--ollama-retries",
+        type=int,
+        default=2,
+        help="Number of Ollama API retries on failure (default: 2).",
     )
     return parser.parse_args()
 
@@ -362,4 +378,5 @@ if __name__ == "__main__":
         args.model,
         args.ollama_host,
         args.ollama_timeout,
+        args.ollama_retries,
     )
