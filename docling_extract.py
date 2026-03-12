@@ -12,8 +12,9 @@ import os
 import argparse
 import json
 import re
-import logging
+import time
 from pathlib import Path
+import logging
 
 from docling.datamodel.base_models import InputFormat
 from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -26,8 +27,6 @@ from rapidocr import RapidOCR
 from rapidocr.utils.typings import LangRec
 from ollama import Client
 
-# Suppress RapidOCR INFO logs
-logging.getLogger("RapidOCR").setLevel(logging.WARNING)
 
 class HybridOCR:
     def __init__(self):
@@ -104,11 +103,11 @@ def extract_ocr_from_image_file(image_path):
     return hybrid_ocr.extract_text(image_path)
 
 
-def extract_ollama_from_image_file(image_path, model, host):
+def extract_ollama_from_image_file(image_path, model, host, timeout):
     """
     Extracts description and text from an image file using Ollama.
     """
-    client = Client(host=host)
+    client = Client(host=host, timeout=timeout)
 
     prompt_simple = """
         **Role**: You are a Senior Cyber Threat Intelligence (CTI) Analyst.
@@ -189,7 +188,12 @@ def process_image_text_for_txt(md_text, output_path, image_text_map, mode="ocr")
 
 
 def extract_from_pdf(
-    pdf_path, output_path, mode="ocr", model=None, ollama_host="http://localhost:11434"
+    pdf_path,
+    output_path,
+    mode="ocr",
+    model=None,
+    ollama_host="http://localhost:11434",
+    ollama_timeout=180,
 ):
     """
     Extracts text, images, and tables from a single PDF document using Docling.
@@ -200,6 +204,7 @@ def extract_from_pdf(
         mode: Image text extraction mode ('ocr' or 'ollama').
         model: Ollama model name (if mode is 'ollama').
         ollama_host: Ollama host URL.
+        ollama_timeout: Ollama API timeout in seconds.
     """
     pdf_path = Path(pdf_path)
     output_path = Path(output_path)
@@ -256,10 +261,17 @@ def extract_from_pdf(
             full_path = output_path / img_rel_path
             if full_path.exists():
                 if mode == "ollama":
-                    print(f"Querying Ollama ({model}) for {img_rel_path}...")
-                    image_text_map[img_rel_path] = extract_ollama_from_image_file(
-                        full_path, model, ollama_host
+                    print(
+                        f"Querying Ollama ({model}) for {img_rel_path}...",
+                        end=" ",
+                        flush=True,
                     )
+                    start_time = time.time()
+                    image_text_map[img_rel_path] = extract_ollama_from_image_file(
+                        full_path, model, ollama_host, ollama_timeout
+                    )
+                    elapsed_time = time.time() - start_time
+                    print(f"done in {elapsed_time:.2f}s")
                 else:
                     print(f"Performing OCR on {img_rel_path}...")
                     image_text_map[img_rel_path] = extract_ocr_from_image_file(
@@ -327,6 +339,12 @@ def parse_arguments():
         default="http://localhost:11434",
         help="Ollama host URL (default: http://localhost:11434).",
     )
+    parser.add_argument(
+        "--ollama-timeout",
+        type=int,
+        default=180,
+        help="Ollama API timeout in seconds (default: 180).",
+    )
     return parser.parse_args()
 
 
@@ -338,5 +356,10 @@ if __name__ == "__main__":
         exit(1)
 
     extract_from_pdf(
-        args.file_path, args.out_path, args.mode, args.model, args.ollama_host
+        args.file_path,
+        args.out_path,
+        args.mode,
+        args.model,
+        args.ollama_host,
+        args.ollama_timeout,
     )
