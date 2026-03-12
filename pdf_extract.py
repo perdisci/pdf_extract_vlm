@@ -6,7 +6,7 @@ Usage:
   python3 pdf_extract.py -f /path/to/input_doc.pdf -o /out/dir/path/
 
 Requirements:
-  pip install pymupdf pymupdf4llm pymupdf-layout rapidocr-onnxruntime pytesseract Pillow
+  pip install pymupdf pymupdf4llm pymupdf-layout rapidocr-onnxruntime pytesseract Pillow ollama
 """
 
 import os
@@ -14,6 +14,7 @@ import csv
 import json
 import argparse
 import re
+import time
 import pymupdf.layout
 import pymupdf
 import pymupdf4llm
@@ -23,6 +24,7 @@ import pytesseract
 from PIL import Image
 from rapidocr import RapidOCR
 from rapidocr.utils.typings import LangRec
+from ollama import Client
 
 class HybridOCR:
     def __init__(self):
@@ -98,49 +100,108 @@ def extract_ocr_from_image_file(image_path):
     return hybrid_ocr.extract_text(image_path)
 
 
-def process_ocr_content(md_text, output_path):
+def extract_ollama_from_image_file(image_path, model, host, timeout, retries=2):
     """
-    Finds image links in markdown, performs OCR, and returns:
-    1. MD text with OCR in invisible comments after image links.
-    2. TXT text with OCR in place of image links.
+    Extracts description and text from an image file using Ollama with retries.
+    """
+    client = Client(host=host, timeout=timeout)
+
+    prompt_simple = """
+        **Role**: You are a Senior Cyber Threat Intelligence (CTI) Analyst.
+
+        Generate a detailed description of the content in the provided image extracted from a CTI technical report.
+
+        Explain the image context and content in detail.
+
+        If there is any text embedded in the image, extract the text and translate it if it is not in English.
+
+        If code is present, such as in a code snippet or code analysis window, extract all of the code text in detail, verbatim.
+
+        If the image contains a system overview graph or flowchart, describe the directional flow of data/attacks.
+
+        **Format Constraints**: Start the response with a line containing `### Image Category: <label>`, where <label> must be chosen among the following: Company Logo, Application Screeshot, Web Page, Code Snippet, Code Analysis, Traffic Analysis, C2 Infrastructure, Phishing Message, Text Document, Flow Chart, System Diagram, Data Table, or Unknown.
+        """
+
+    for attempt in range(retries + 1):
+        try:
+            response = client.generate(
+                model=model,
+                prompt=prompt_simple,
+                images=[image_path],
+                stream=False,
+                options={
+                    "temperature": 0.1,
+                },
+            )
+            return response["response"]
+        except Exception as e:
+            if attempt < retries:
+                print(
+                    f"\nWarning: Ollama query failed for {image_path.name} (attempt {attempt + 1}/{retries + 1}): {e}. Retrying in 2s..."
+                )
+                time.sleep(2)
+            else:
+                print(
+                    f"\nError: Ollama query failed after {retries + 1} attempts for {image_path.name}: {e}"
+                )
+                return None
+
+
+def process_image_text_for_md(md_text, output_path, image_text_map, mode="ocr"):
+    """
+    Finds image links in markdown and appends an invisible comment with extracted text.
     """
     img_regex = r"!\[(.*?)\]\((.*?)\)"
     md_content = md_text
-    txt_content = md_text
-    
+    label = "OCR" if mode == "ocr" else "Ollama"
+
     matches = re.findall(img_regex, md_text)
     for alt_text, img_rel_path in matches:
-        full_path = output_path / img_rel_path
-        if full_path.exists():
-            print(f"Performing OCR on {img_rel_path}...")
-            ocr_text = extract_ocr_from_image_file(full_path)
-            
+        text = image_text_map.get(img_rel_path)
+        if text:
+            # Escape -- to avoid breaking the comment
+            safe_text = text.replace("--", "- -")
+            comment = f"\n<!-- {label}: {safe_text} -->\n"
             target = f"![{alt_text}]({img_rel_path})"
-            
-            # Update MD content with invisible comment
-            if ocr_text:
-                # Escape --> to avoid breaking the HTML comment
-                safe_ocr = ocr_text.replace("-->", "-- >")
-                md_comment = f" <!-- OCR_TEXT: {safe_ocr} -->"
-            else:
-                md_comment = " <!-- OCR failed or no text detected -->"
-            
-            md_content = md_content.replace(target, target + md_comment, 1)
-            
-            # Update TXT content with visible OCR block
-            replacement = f"\n\n[START_OCR_TEXT_FROM_IMAGE: {img_rel_path}]\n"
-            if ocr_text:
-                replacement += ocr_text
-            else:
-                replacement += "[No text detected or OCR failed]"
-            replacement += "\n[END_OCR_TEXT_FROM_IMAGE]\n\n"
-            
-            txt_content = txt_content.replace(target, replacement, 1)
-            
-    return md_content, txt_content
+            md_content = md_content.replace(target, target + comment, 1)
+
+    return md_content
 
 
-def extract_from_pdf(pdf_path, output_path):
+def process_image_text_for_txt(md_text, output_path, image_text_map, mode="ocr"):
+    """
+    Finds image links in markdown and replaces them with extracted text for the .txt version.
+    """
+    img_regex = r"!\[(.*?)\]\((.*?)\)"
+    txt_content = md_text
+    label = "OCR" if mode == "ocr" else "OLLAMA"
+
+    matches = re.findall(img_regex, md_text)
+    for alt_text, img_rel_path in matches:
+        text = image_text_map.get(img_rel_path)
+
+        replacement = f"\n\n[START_{label}_TEXT_FROM_IMAGE: {img_rel_path}]\n"
+        if text:
+            replacement += text
+        else:
+            replacement += f"[No text detected or {label} failed]"
+        replacement += f"\n[END_{label}_TEXT_FROM_IMAGE]\n\n"
+
+        target = f"![{alt_text}]({img_rel_path})"
+        txt_content = txt_content.replace(target, replacement, 1)
+
+    return txt_content
+
+
+def extract_from_pdf(
+    pdf_path,
+    output_path,
+    mode="ocr",
+    model=None,
+    ollama_host="http://localhost:11434",
+    ollama_timeout=300,
+    ollama_retries=2,
+):
     """
     Extracts text, images, and tables from a single PDF document using 
     advanced PyMuPDF features (pymupdf4llm and layout analysis).
@@ -148,6 +209,11 @@ def extract_from_pdf(pdf_path, output_path):
     Args:
         pdf_path: Path to the input PDF file.
         output_path: Path where parsed PDF output will be saved.
+        mode: Image text extraction mode ('ocr' or 'ollama').
+        model: Ollama model name (if mode is 'ollama').
+        ollama_host: Ollama host URL.
+        ollama_timeout: Ollama API timeout in seconds.
+        ollama_retries: Number of Ollama API retries on failure.
     """
     pdf_path = Path(pdf_path).absolute()
     output_path = Path(output_path).absolute()
@@ -175,15 +241,44 @@ def extract_from_pdf(pdf_path, output_path):
     finally:
         os.chdir(original_cwd)
     
-    # 2. Process images for OCR (enriched MD and TXT versions)
-    print("Processing images for OCR...")
-    enriched_md, txt_text = process_ocr_content(md_text, output_path)
+    # Pre-calculate OCR or Ollama analysis for all images to avoid redundant processing
+    image_text_map = {}
+    img_regex = r"!\[(.*?)\]\((.*?)\)"
+    matches = re.findall(img_regex, md_text)
+    for _, img_rel_path in matches:
+        if img_rel_path not in image_text_map:
+            full_path = output_path / img_rel_path
+            if full_path.exists():
+                if mode == "ollama":
+                    print(
+                        f"Querying Ollama ({model}) for {img_rel_path}...",
+                        end=" ",
+                        flush=True,
+                    )
+                    start_time = time.time()
+                    image_text_map[img_rel_path] = extract_ollama_from_image_file(
+                        full_path, model, ollama_host, ollama_timeout, ollama_retries
+                    )
+                    elapsed_time = time.time() - start_time
+                    print(f"done in {elapsed_time:.2f}s")
+                else:
+                    print(f"Performing OCR on {img_rel_path}...")
+                    image_text_map[img_rel_path] = extract_ocr_from_image_file(
+                        full_path
+                    )
 
-    # Save the Markdown version (contains relative image links + OCR comments)
+    # Save the Markdown version with invisible comments
+    md_with_text = process_image_text_for_md(
+        md_text, output_path, image_text_map, mode
+    )
     with open(output_path / f"{base_name}.md", "w", encoding="utf-8") as f:
-        f.write(enriched_md)
+        f.write(md_with_text)
 
-    # Save the .txt version with OCR'd image text in place
+    # Save the .txt version with extracted image text in place
+    print("Generating the text version...")
+    txt_text = process_image_text_for_txt(
+        md_text, output_path, image_text_map, mode
+    )
     with open(output_path / f"{base_name}.txt", "w", encoding="utf-8") as f:
         f.write(txt_text)
 
@@ -226,6 +321,36 @@ def parse_arguments():
         help="Directory where to store the parsed results.",
         required=True,
     )
+    parser.add_argument(
+        "--mode",
+        choices=["ocr", "ollama"],
+        default="ocr",
+        help="Image text extraction mode: 'ocr' (default) or 'ollama'.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="qwen3-vl:32b",
+        help="Ollama model name (default: qwen3-vl:32b).",
+    )
+    parser.add_argument(
+        "--ollama-host",
+        type=str,
+        default="http://localhost:11434",
+        help="Ollama host URL (default: http://localhost:11434).",
+    )
+    parser.add_argument(
+        "--ollama-timeout",
+        type=int,
+        default=300,
+        help="Ollama API timeout in seconds (default: 300).",
+    )
+    parser.add_argument(
+        "--ollama-retries",
+        type=int,
+        default=2,
+        help="Number of Ollama API retries on failure (default: 2).",
+    )
     return parser.parse_args()
 
 
@@ -236,4 +361,12 @@ if __name__ == "__main__":
         print(f"Error: PDF file not found at '{args.file_path}'")
         exit(1)
 
-    extract_from_pdf(args.file_path, args.out_path)
+    extract_from_pdf(
+        args.file_path,
+        args.out_path,
+        args.mode,
+        args.model,
+        args.ollama_host,
+        args.ollama_timeout,
+        args.ollama_retries,
+    )
