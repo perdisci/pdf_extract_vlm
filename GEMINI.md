@@ -38,7 +38,7 @@ source venv/bin/activate
 
 # Install dependencies
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install pymupdf pymupdf4llm pymupdf-layout pytesseract Pillow docling ollama
 ```
 
 ### Usage
@@ -57,7 +57,18 @@ source venv/bin/activate
 python3 docling_extract.py -f /path/to/input_doc.pdf -o /out/dir/path/
 ```
 
+### Testing & Extra Tools
+
+#### Ollama Multimodal Query
+A test script is available to query an Ollama model with extracted images for further analysis (e.g., detail explanation, text extraction, and translation):
+
+```bash
+source venv/bin/activate
+python3 tests/ollama_prompt_multimodal.py --image /path/to/extracted/image.png --model gemma3:27b-it-fp16
+```
+
 ### Output Structure
+
 
 Both scripts generate output in the specified directory, including:
 - JSON representation of the document structure.
