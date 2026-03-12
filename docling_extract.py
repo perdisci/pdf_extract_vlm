@@ -12,6 +12,7 @@ import os
 import argparse
 import json
 import re
+import logging
 from pathlib import Path
 
 from docling.datamodel.base_models import InputFormat
@@ -23,6 +24,10 @@ import pytesseract
 from PIL import Image
 from rapidocr import RapidOCR
 from rapidocr.utils.typings import LangRec
+from ollama import Client
+
+# Suppress RapidOCR INFO logs
+logging.getLogger("RapidOCR").setLevel(logging.WARNING)
 
 class HybridOCR:
     def __init__(self):
@@ -42,38 +47,37 @@ class HybridOCR:
         if lang not in self.engines:
             # rec_lang is passed via nested key "Rec.lang_type"
             # use_cls is under "Global.use_cls"
-            self.engines[lang] = RapidOCR(params={
-                "Rec.lang_type": lang, 
-                "Global.use_cls": True
-            })
+            self.engines[lang] = RapidOCR(
+                params={"Rec.lang_type": lang, "Global.use_cls": True}
+            )
         return self.engines[lang]
 
     def extract_text(self, image_path):
         try:
             # Phase 1: Routing & Orientation Detection
             osd = pytesseract.image_to_osd(str(image_path))
-            
+
             # Parse OSD output
             osd_data = {}
             for line in osd.splitlines():
                 if ":" in line:
                     key, value = line.split(":", 1)
                     osd_data[key.strip()] = value.strip()
-            
+
             script = osd_data.get("Script", "Latin")
             rotate = int(osd_data.get("Rotate", 0))
-            
+
             # Phase 2: Logic - Map Script to RapidOCR model
             rec_lang = self.script_to_lang.get(script, LangRec.EN)
-            
+
             # Phase 3: Extraction
             engine = self.get_engine(rec_lang)
-            
+
             # Load and rotate image if Tesseract detects orientation
             img = Image.open(image_path)
             if rotate != 0:
                 img = img.rotate(-rotate, expand=True)
-            
+
             output = engine(img)
             if output and output.txts:
                 return "\n".join(output.txts)
@@ -88,6 +92,7 @@ class HybridOCR:
                 return None
         return None
 
+
 # Initialize HybridOCR engine once
 hybrid_ocr = HybridOCR()
 
@@ -99,57 +104,102 @@ def extract_ocr_from_image_file(image_path):
     return hybrid_ocr.extract_text(image_path)
 
 
-def process_ocr_for_md(md_text, output_path, ocr_map):
+def extract_ollama_from_image_file(image_path, model, host):
     """
-    Finds image links in markdown and appends an invisible comment with OCR text.
+    Extracts description and text from an image file using Ollama.
+    """
+    client = Client(host=host)
+
+    prompt_simple = """
+        **Role**: You are a Senior Cyber Threat Intelligence (CTI) Analyst.
+
+        Generate a detailed description of the content in the provided image extracted from a CTI technical report.
+
+        Explain the image context and content in detail.
+
+        If there is any text embedded in the image, extract the text and translate it if it is not in English.
+
+        If code is present, such as in a code snippet or code analysis window, extract all of the code text in detail, verbatim.
+
+        If the image contains a system overview graph or flowchart, describe the directional flow of data/attacks.
+
+        **Format Constraints**: Start the response with a line containing `### Image Category: <label>`, where <label> must be chosen among the following: Company Logo, Application Screeshot, Web Page, Code Snippet, Code Analysis, Traffic Analysis, C2 Infrastructure, Phishing Message, Text Document, Flow Chart, System Diagram, Data Table, or Unknown.
+        """
+
+    try:
+        response = client.generate(
+            model=model,
+            prompt=prompt_simple,
+            images=[image_path],
+            stream=False,
+            options={
+                "temperature": 0.1,
+            },
+        )
+        return response["response"]
+    except Exception as e:
+        print(f"Error querying Ollama for {image_path}: {e}")
+        return None
+
+
+def process_image_text_for_md(md_text, output_path, image_text_map, mode="ocr"):
+    """
+    Finds image links in markdown and appends an invisible comment with extracted text.
     """
     img_regex = r"!\[(.*?)\]\((.*?)\)"
     md_content = md_text
-    
+    label = "OCR" if mode == "ocr" else "Ollama"
+
     matches = re.findall(img_regex, md_text)
     for alt_text, img_rel_path in matches:
-        ocr_text = ocr_map.get(img_rel_path)
-        if ocr_text:
-            # Escape --> to avoid breaking the comment
-            safe_ocr_text = ocr_text.replace("-->", "-- >")
-            comment = f" <!-- OCR: {safe_ocr_text} -->"
+        text = image_text_map.get(img_rel_path)
+        if text:
+            # Escape -- to avoid breaking the comment
+            safe_text = text.replace("--", "- -")
+            comment = f" <!-- {label}: {safe_text} -->"
             target = f"![{alt_text}]({img_rel_path})"
             md_content = md_content.replace(target, target + comment, 1)
-                
+
     return md_content
 
 
-def process_ocr_for_txt(md_text, output_path, ocr_map):
+def process_image_text_for_txt(md_text, output_path, image_text_map, mode="ocr"):
     """
-    Finds image links in markdown and replaces them with OCR text for the .txt version.
+    Finds image links in markdown and replaces them with extracted text for the .txt version.
     """
     img_regex = r"!\[(.*?)\]\((.*?)\)"
     txt_content = md_text
-    
+    label = "OCR" if mode == "ocr" else "OLLAMA"
+
     matches = re.findall(img_regex, md_text)
     for alt_text, img_rel_path in matches:
-        ocr_text = ocr_map.get(img_rel_path)
-        
-        replacement = f"\n\n[START_OCR_TEXT_FROM_IMAGE: {img_rel_path}]\n"
-        if ocr_text:
-            replacement += ocr_text
+        text = image_text_map.get(img_rel_path)
+
+        replacement = f"\n\n[START_{label}_TEXT_FROM_IMAGE: {img_rel_path}]\n"
+        if text:
+            replacement += text
         else:
-            replacement += "[No text detected or OCR failed]"
-        replacement += "\n[END_OCR_TEXT_FROM_IMAGE]\n\n"
-        
+            replacement += f"[No text detected or {label} failed]"
+        replacement += f"\n[END_{label}_TEXT_FROM_IMAGE]\n\n"
+
         target = f"![{alt_text}]({img_rel_path})"
         txt_content = txt_content.replace(target, replacement, 1)
-            
+
     return txt_content
 
 
-def extract_from_pdf(pdf_path, output_path):
+def extract_from_pdf(
+    pdf_path, output_path, mode="ocr", model=None, ollama_host="http://localhost:11434"
+):
     """
     Extracts text, images, and tables from a single PDF document using Docling.
 
     Args:
         pdf_path: Path to the input PDF file.
         output_path: Path where parsed PDF output will be saved.
+        mode: Image text extraction mode ('ocr' or 'ollama').
+        model: Ollama model name (if mode is 'ollama').
+        ollama_host: Ollama host URL.
     """
     pdf_path = Path(pdf_path)
     output_path = Path(output_path)
@@ -160,7 +210,9 @@ def extract_from_pdf(pdf_path, output_path):
     pipeline_options.do_ocr = True  # Enable OCR for images
     pipeline_options.do_table_structure = True  # Enable table structure extraction
     pipeline_options.images_scale = 2.0  # Scale images for better quality
-    pipeline_options.generate_picture_images = True # Required for image extraction in v2
+    pipeline_options.generate_picture_images = (
+        True  # Required for image extraction in v2
+    )
 
     converter = DocumentConverter(
         format_options={
@@ -182,7 +234,7 @@ def extract_from_pdf(pdf_path, output_path):
         pil_img = picture.get_image(doc)
         img_filename = f"image_{i}.png"
         pil_img.save(out_img_path / img_filename)
-        
+
         # Set the URI for the referenced image mode
         if picture.image:
             picture.image.uri = f"{base_name}_images/{img_filename}"
@@ -195,32 +247,44 @@ def extract_from_pdf(pdf_path, output_path):
     # Since we set the URIs manually, REFERENCED mode will use them.
     markdown_content = doc.export_to_markdown(image_mode=ImageRefMode.REFERENCED)
 
-    # Pre-calculate OCR for all images to avoid redundant processing
-    ocr_map = {}
+    # Pre-calculate OCR or Ollama analysis for all images to avoid redundant processing
+    image_text_map = {}
     img_regex = r"!\[(.*?)\]\((.*?)\)"
     matches = re.findall(img_regex, markdown_content)
     for _, img_rel_path in matches:
-        if img_rel_path not in ocr_map:
+        if img_rel_path not in image_text_map:
             full_path = output_path / img_rel_path
             if full_path.exists():
-                print(f"Performing OCR on {img_rel_path}...")
-                ocr_map[img_rel_path] = extract_ocr_from_image_file(full_path)
+                if mode == "ollama":
+                    print(f"Querying Ollama ({model}) for {img_rel_path}...")
+                    image_text_map[img_rel_path] = extract_ollama_from_image_file(
+                        full_path, model, ollama_host
+                    )
+                else:
+                    print(f"Performing OCR on {img_rel_path}...")
+                    image_text_map[img_rel_path] = extract_ocr_from_image_file(
+                        full_path
+                    )
 
-    # Save the Markdown version with invisible OCR comments
-    md_with_ocr = process_ocr_for_md(markdown_content, output_path, ocr_map)
+    # Save the Markdown version with invisible comments
+    md_with_text = process_image_text_for_md(
+        markdown_content, output_path, image_text_map, mode
+    )
     with open(output_path / f"{base_name}.md", "w", encoding="utf-8") as f:
-        f.write(md_with_ocr)
+        f.write(md_with_text)
 
-    # 4. Save as Plain Text with OCR'd image text in place
+    # 4. Save as Plain Text with extracted image text in place
     print("Generating the text version...")
-    txt_text = process_ocr_for_txt(markdown_content, output_path, ocr_map)
+    txt_text = process_image_text_for_txt(
+        markdown_content, output_path, image_text_map, mode
+    )
     with open(output_path / f"{base_name}.txt", "w", encoding="utf-8") as f:
         f.write(txt_text)
 
     # 5. Extract and save tables as CSV
     out_tab_path = output_path / f"{base_name}_tables"
     out_tab_path.mkdir(exist_ok=True)
-    
+
     for i, table_element in enumerate(doc.tables):
         # Docling can export tables to pandas dataframes
         df = table_element.export_to_dataframe()
@@ -245,14 +309,34 @@ def parse_arguments():
         help="Directory where to store the parsed document and extracted images.",
         required=True,
     )
+    parser.add_argument(
+        "--mode",
+        choices=["ocr", "ollama"],
+        default="ocr",
+        help="Image text extraction mode: 'ocr' (default) or 'ollama'.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="qwen3-vl:32b",
+        help="Ollama model name (default: qwen3-vl:32b).",
+    )
+    parser.add_argument(
+        "--ollama-host",
+        type=str,
+        default="http://localhost:11434",
+        help="Ollama host URL (default: http://localhost:11434).",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_arguments()
-    
+
     if not os.path.exists(args.file_path):
         print(f"Error: PDF file not found at '{args.file_path}'")
         exit(1)
 
-    extract_from_pdf(args.file_path, args.out_path)
+    extract_from_pdf(
+        args.file_path, args.out_path, args.mode, args.model, args.ollama_host
+    )
