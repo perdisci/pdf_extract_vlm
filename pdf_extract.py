@@ -37,7 +37,7 @@ class ImageAnalysisCache:
     def __init__(self, cache_file=".image_analysis_cache.json", threshold=0):
         self.cache_file = Path(cache_file)
         self.threshold = threshold
-        self.cache = []  # List of dicts: {"hash": str, "results": dict}
+        self.cache = []  # List of dicts: {"hash": str, "results": dict, "path": str}
         self.load()
 
     def load(self):
@@ -74,21 +74,29 @@ class ImageAnalysisCache:
                 return {"value": entry["results"].get(key), "distance": distance}
         return None
 
-    def update(self, current_hash, key, value):
+    def update(self, current_hash, key, value, image_path=None):
         if current_hash is None or value is None:
             return
 
         hash_str = str(current_hash)
+        path_str = str(image_path) if image_path else "unknown"
+        
         # Try to find an existing entry within the threshold to update
         for entry in self.cache:
             stored_hash = imagehash.hex_to_hash(entry["hash"])
             if (current_hash - stored_hash) <= self.threshold:
                 entry["results"][key] = value
+                # Optionally update path to the latest reference
+                entry["path"] = path_str
                 self.save()
                 return
 
         # No existing entry found, add a new one
-        self.cache.append({"hash": hash_str, "results": {key: value}})
+        self.cache.append({
+            "hash": hash_str, 
+            "results": {key: value},
+            "path": path_str
+        })
         self.save()
 
 
@@ -283,6 +291,7 @@ def extract_from_pdf(
         ollama_timeout: Ollama API timeout in seconds.
         ollama_retries: Number of Ollama API retries on failure.
     """
+    total_start_time = time.time()
     pdf_path = Path(pdf_path).absolute()
     output_path = Path(output_path).absolute()
     output_path.mkdir(parents=True, exist_ok=True)
@@ -295,6 +304,7 @@ def extract_from_pdf(
     # 1. Advanced Layout-Aware Text/Markdown Extraction with Images
     logger.info(f"Extracting layout-aware markdown and images from: {pdf_path}")
 
+    initial_parsing_start = time.time()
     # We change directory to output_path so that pymupdf4llm saves images
     # with relative paths in the markdown content.
     original_cwd = os.getcwd()
@@ -308,6 +318,9 @@ def extract_from_pdf(
         )
     finally:
         os.chdir(original_cwd)
+    
+    initial_parsing_duration = time.time() - initial_parsing_start
+    logger.info(f"Initial layout-aware parsing completed in {initial_parsing_duration:.2f}s")
 
     # Pre-calculate OCR or Ollama analysis for all images to avoid redundant processing
     image_text_map = {}
@@ -339,7 +352,7 @@ def extract_from_pdf(
                         logger.info(
                             f"Ollama query successful for {img_rel_path}; done in {elapsed_time:.2f}s"
                         )
-                        image_cache.update(phash, "ollama", result)
+                        image_cache.update(phash, "ollama", result, full_path)
                     else:
                         # Fallback to OCR if Ollama failed after all retries
                         logger.warning(
@@ -347,12 +360,12 @@ def extract_from_pdf(
                         )
                         result = extract_ocr_from_image_file(full_path)
                         image_text_map[img_rel_path] = result
-                        image_cache.update(phash, "ocr", result)
+                        image_cache.update(phash, "ocr", result, full_path)
                 else:
                     logger.info(f"Performing OCR on {img_rel_path}...")
                     result = extract_ocr_from_image_file(full_path)
                     image_text_map[img_rel_path] = result
-                    image_cache.update(phash, "ocr", result)
+                    image_cache.update(phash, "ocr", result, full_path)
 
     # Save the Markdown version with invisible comments
     md_with_text = process_image_text_for_md(md_text, output_path, image_text_map, mode)
@@ -391,7 +404,9 @@ def extract_from_pdf(
                 writer = csv.writer(csvfile)
                 writer.writerows(table_data)
 
+    total_duration = time.time() - total_start_time
     logger.info(f"Extraction complete. Results saved in: {output_path}")
+    logger.info(f"Total processing time: {total_duration:.2f}s")
 
 
 def parse_arguments():
@@ -439,6 +454,12 @@ def parse_arguments():
         default=2,
         help="Number of Ollama API retries on failure (default: 2).",
     )
+    parser.add_argument(
+        "--phash-th",
+        type=int,
+        default=5,
+        help="Perceptual hash distance threshold for image matching (default: 5).",
+    )
     return parser.parse_args()
 
 
@@ -448,6 +469,9 @@ if __name__ == "__main__":
     if not os.path.exists(args.file_path):
         logger.error(f"PDF file not found at '{args.file_path}'")
         exit(1)
+
+    # Set the pHash threshold from CLI
+    image_cache.threshold = args.phash_th
 
     extract_from_pdf(
         args.file_path,
