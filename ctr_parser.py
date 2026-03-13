@@ -30,8 +30,13 @@ from rapidocr.utils.typings import LangRec
 from ollama import Client
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+# Suppress HTTP request logs from underlying libraries unless root logger is in DEBUG mode
+if logger.getEffectiveLevel() > logging.DEBUG:
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 class ImageAnalysisCache:
