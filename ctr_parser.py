@@ -21,6 +21,7 @@ import pymupdf
 import pymupdf4llm
 from pathlib import Path
 import imagehash
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytesseract
 from PIL import Image
@@ -88,7 +89,6 @@ class ImageAnalysisCache:
                 entry["results"][key] = value
                 # Optionally update path to the latest reference
                 entry["path"] = path_str
-                self.save()
                 return
 
         # No existing entry found, add a new one
@@ -97,7 +97,6 @@ class ImageAnalysisCache:
             "results": {key: value},
             "path": path_str
         })
-        self.save()
 
 
 class HybridOCR:
@@ -163,40 +162,27 @@ class HybridOCR:
         return None
 
 
-# Initialize HybridOCR engine once
-hybrid_ocr = HybridOCR()
-# Initialize Image Analysis Cache
-image_cache = ImageAnalysisCache()
+def load_prompts(config_file="prompts.json"):
+    try:
+        with open(config_file, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load prompts from {config_file}. Error: {e}")
+        return {}
 
 
-def extract_ocr_from_image_file(image_path):
+def extract_ocr_from_image_file(image_path, hybrid_ocr):
     """
     Extracts text from an image file using Hybrid OCR (Tesseract + RapidOCR).
     """
     return hybrid_ocr.extract_text(image_path)
 
 
-def extract_ollama_from_image_file(image_path, model, host, timeout, retries=2):
+def extract_ollama_from_image_file(image_path, model, host, timeout, prompt_simple, retries=2):
     """
     Extracts description and text from an image file using Ollama with retries.
     """
     client = Client(host=host, timeout=timeout)
-
-    prompt_simple = """
-        **Role**: You are a Senior Cyber Threat Intelligence (CTI) Analyst.
-
-        Generate a detailed description of the content in the provided image extracted from a CTI technical report.
-
-        Explain the image context and content in detail.
-
-        If there is any text embedded in the image, extract the text and translate it if it is not in English.
-
-        If code is present, such as in a code snippet or code analysis window, extract all of the code text in detail, verbatim.
-
-        If the image contains a system overview graph or flowchart, describe the directional flow of data/attacks.
-
-        **Format Constraints**: Start the response with a line containing `### Image Category: <label>`, where <label> must be chosen among the following: Company Logo, Application Screeshot, Web Page, Code Snippet, Code Analysis, Traffic Analysis, C2 Infrastructure, Phishing Message, Text Document, Flow Chart, System Diagram, Data Table, or Unknown.
-        """
 
     for attempt in range(retries + 1):
         try:
@@ -223,16 +209,19 @@ def extract_ollama_from_image_file(image_path, model, host, timeout, retries=2):
                 return None
 
 
+def get_image_links_from_markdown(md_text):
+    """Extracts all image links from markdown text."""
+    img_regex = r"!\[(.*?)\]\((.*?)\)"
+    return re.findall(img_regex, md_text)
+
 def process_image_text_for_md(md_text, output_path, image_text_map, mode="ocr"):
     """
     Finds image links in markdown and appends an invisible comment with extracted text.
     """
-    img_regex = r"!\[(.*?)\]\((.*?)\)"
     md_content = md_text
     label = "OCR" if mode == "ocr" else "Ollama"
 
-    matches = re.findall(img_regex, md_text)
-    for alt_text, img_rel_path in matches:
+    for alt_text, img_rel_path in get_image_links_from_markdown(md_text):
         text = image_text_map.get(img_rel_path)
         if text:
             # Escape -- to avoid breaking the comment
@@ -248,12 +237,10 @@ def process_image_text_for_txt(md_text, output_path, image_text_map, mode="ocr")
     """
     Finds image links in markdown and replaces them with extracted text for the .txt version.
     """
-    img_regex = r"!\[(.*?)\]\((.*?)\)"
     txt_content = md_text
     label = "OCR" if mode == "ocr" else "OLLAMA"
 
-    matches = re.findall(img_regex, md_text)
-    for alt_text, img_rel_path in matches:
+    for alt_text, img_rel_path in get_image_links_from_markdown(md_text):
         text = image_text_map.get(img_rel_path)
 
         replacement = f"\n\n[START_{label}_TEXT_FROM_IMAGE: {img_rel_path}]\n"
@@ -272,11 +259,14 @@ def process_image_text_for_txt(md_text, output_path, image_text_map, mode="ocr")
 def extract_from_pdf(
     pdf_path,
     output_path,
+    hybrid_ocr,
+    image_cache,
     mode="ocr",
     model=None,
     ollama_host="http://localhost:11434",
     ollama_timeout=300,
     ollama_retries=2,
+    max_threads=1,
 ):
     """
     Extracts text, images, and tables from a single PDF document using
@@ -285,11 +275,14 @@ def extract_from_pdf(
     Args:
         pdf_path: Path to the input PDF file.
         output_path: Path where parsed PDF output will be saved.
+        hybrid_ocr: Instance of HybridOCR.
+        image_cache: Instance of ImageAnalysisCache.
         mode: Image text extraction mode ('ocr' or 'ollama').
         model: Ollama model name (if mode is 'ollama').
         ollama_host: Ollama host URL.
         ollama_timeout: Ollama API timeout in seconds.
         ollama_retries: Number of Ollama API retries on failure.
+        max_threads: Max threads for concurrent image processing.
     """
     total_start_time = time.time()
     pdf_path = Path(pdf_path).absolute()
@@ -324,48 +317,75 @@ def extract_from_pdf(
 
     # Pre-calculate OCR or Ollama analysis for all images to avoid redundant processing
     image_text_map = {}
-    img_regex = r"!\[(.*?)\]\((.*?)\)"
-    matches = re.findall(img_regex, md_text)
-    for _, img_rel_path in matches:
-        if img_rel_path not in image_text_map:
-            full_path = output_path / img_rel_path
-            if full_path.exists():
-                # Check cache first
-                phash = image_cache.get_phash(full_path)
-                cached_result = image_cache.find_match(phash, mode)
-                if cached_result:
-                    logger.info(
-                        f"Cache hit for {img_rel_path} (mode: {mode}, distance: {cached_result['distance']})"
-                    )
-                    image_text_map[img_rel_path] = cached_result["value"]
-                    continue
+    matches = get_image_links_from_markdown(md_text)
+    
+    prompts = load_prompts()
+    ollama_prompt = prompts.get("ollama_image_analysis", "")
 
-                if mode == "ollama":
-                    logger.info(f"Querying Ollama ({model}) for {img_rel_path}...")
-                    start_time = time.time()
-                    result = extract_ollama_from_image_file(
-                        full_path, model, ollama_host, ollama_timeout, ollama_retries
-                    )
-                    image_text_map[img_rel_path] = result
-                    elapsed_time = time.time() - start_time
-                    if result is not None:
-                        logger.info(
-                            f"Ollama query successful for {img_rel_path}; done in {elapsed_time:.2f}s"
-                        )
-                        image_cache.update(phash, "ollama", result, full_path)
-                    else:
-                        # Fallback to OCR if Ollama failed after all retries
-                        logger.warning(
-                            f"Ollama failed for {img_rel_path}. Falling back to OCR..."
-                        )
-                        result = extract_ocr_from_image_file(full_path)
+    unique_image_paths = list(set([img_rel_path for _, img_rel_path in matches]))
+    tasks_to_run = {}
+    
+    # Pre-process cache checks sequentially to deduplicate identical unseen images
+    for img_rel_path in unique_image_paths:
+        full_path = output_path / img_rel_path
+        if not full_path.exists():
+            continue
+            
+        phash = image_cache.get_phash(full_path)
+        if phash is None:
+            continue
+            
+        cached_result = image_cache.find_match(phash, mode)
+        if cached_result:
+            logger.info(f"Cache hit for {img_rel_path} (mode: {mode}, distance: {cached_result['distance']})")
+            image_text_map[img_rel_path] = cached_result["value"]
+        else:
+            phash_str = str(phash)
+            if phash_str not in tasks_to_run:
+                tasks_to_run[phash_str] = {'paths': [], 'full_path': full_path, 'phash': phash}
+            tasks_to_run[phash_str]['paths'].append(img_rel_path)
+
+    def run_extraction(full_path):
+        if mode == "ollama":
+            logger.info(f"Querying Ollama ({model}) for {full_path.name}...")
+            start_time = time.time()
+            result = extract_ollama_from_image_file(
+                full_path, model, ollama_host, ollama_timeout, ollama_prompt, ollama_retries
+            )
+            elapsed_time = time.time() - start_time
+            if result is not None:
+                logger.info(f"Ollama query successful for {full_path.name}; done in {elapsed_time:.2f}s")
+                return result, "ollama"
+            else:
+                # Fallback to OCR if Ollama failed after all retries
+                logger.warning(f"Ollama failed for {full_path.name}. Falling back to OCR...")
+                result = extract_ocr_from_image_file(full_path, hybrid_ocr)
+                return result, "ocr"
+        else:
+            logger.info(f"Performing OCR on {full_path.name}...")
+            result = extract_ocr_from_image_file(full_path, hybrid_ocr)
+            return result, "ocr"
+
+    updates_made = False
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        futures = {executor.submit(run_extraction, task['full_path']): phash_str for phash_str, task in tasks_to_run.items()}
+        for future in as_completed(futures):
+            phash_str = futures[future]
+            task = tasks_to_run[phash_str]
+            try:
+                result, update_mode = future.result()
+                if result is not None:
+                    for img_rel_path in task['paths']:
                         image_text_map[img_rel_path] = result
-                        image_cache.update(phash, "ocr", result, full_path)
-                else:
-                    logger.info(f"Performing OCR on {img_rel_path}...")
-                    result = extract_ocr_from_image_file(full_path)
-                    image_text_map[img_rel_path] = result
-                    image_cache.update(phash, "ocr", result, full_path)
+                if update_mode:
+                    image_cache.update(task['phash'], update_mode, result, task['full_path'])
+                    updates_made = True
+            except Exception as exc:
+                logger.error(f"Image processing generated an exception for phash {phash_str}: {exc}")
+
+    # Batch cache writes
+    if updates_made:
+        image_cache.save()
 
     # Save the Markdown version with invisible comments
     md_with_text = process_image_text_for_md(md_text, output_path, image_text_map, mode)
@@ -460,6 +480,12 @@ def parse_arguments():
         default=5,
         help="Perceptual hash distance threshold for image matching (default: 5).",
     )
+    parser.add_argument(
+        "--max-threads",
+        type=int,
+        default=1,
+        help="Maximum number of threads for image processing (default: 1).",
+    )
     return parser.parse_args()
 
 
@@ -470,15 +496,20 @@ if __name__ == "__main__":
         logger.error(f"PDF file not found at '{args.file_path}'")
         exit(1)
 
-    # Set the pHash threshold from CLI
-    image_cache.threshold = args.phash_th
+    # Initialize dependencies
+    hybrid_ocr_engine = HybridOCR()
+    image_analysis_cache = ImageAnalysisCache()
+    image_analysis_cache.threshold = args.phash_th
 
     extract_from_pdf(
         args.file_path,
         args.out_path,
+        hybrid_ocr_engine,
+        image_analysis_cache,
         args.mode,
         args.model,
         args.ollama_host,
         args.ollama_timeout,
         args.ollama_retries,
+        args.max_threads,
     )
