@@ -1,5 +1,5 @@
 """
-This script processes PDF documents and extracts text, images, and tables using 
+This script processes PDF documents and extracts text, images, and tables using
 modernized PyMuPDF features, including layout analysis and LLM-ready markdown.
 
 Usage:
@@ -26,6 +26,7 @@ from rapidocr import RapidOCR
 from rapidocr.utils.typings import LangRec
 from ollama import Client
 
+
 class HybridOCR:
     def __init__(self):
         self.engines = {}
@@ -44,37 +45,36 @@ class HybridOCR:
         if lang not in self.engines:
             # rec_lang is passed via nested key "Rec.lang_type"
             # use_cls is under "Global.use_cls"
-            self.engines[lang] = RapidOCR(params={
-                "Rec.lang_type": lang, 
-                "Global.use_cls": True
-            })
+            self.engines[lang] = RapidOCR(
+                params={"Rec.lang_type": lang, "Global.use_cls": True}
+            )
         return self.engines[lang]
 
     def extract_text(self, image_path):
         try:
             # Phase 1: Routing & Orientation Detection
             osd = pytesseract.image_to_osd(str(image_path))
-            
+
             # Parse OSD output
             osd_data = {}
             for line in osd.splitlines():
                 if ":" in line:
                     key, value = line.split(":", 1)
                     osd_data[key.strip()] = value.strip()
-            
+
             script = osd_data.get("Script", "Latin")
             rotate = int(osd_data.get("Rotate", 0))
-            
+
             # Phase 2: Logic - Map Script to RapidOCR model
             rec_lang = self.script_to_lang.get(script, LangRec.EN)
-            
+
             # Phase 3: Extraction
             engine = self.get_engine(rec_lang)
-            
+
             img = Image.open(image_path)
             if rotate != 0:
                 img = img.rotate(-rotate, expand=True)
-            
+
             output = engine(img)
             if output and output.txts:
                 return "\n".join(output.txts)
@@ -88,6 +88,7 @@ class HybridOCR:
             except:
                 return None
         return None
+
 
 # Initialize HybridOCR engine once
 hybrid_ocr = HybridOCR()
@@ -161,7 +162,7 @@ def process_image_text_for_md(md_text, output_path, image_text_map, mode="ocr"):
         if text:
             # Escape -- to avoid breaking the comment
             safe_text = text.replace("--", "- -")
-            comment = f"\n<!-- {label}: {safe_text} -->\n"
+            comment = f"\n<!-- Image Description ({label}): {safe_text} -->\n"
             target = f"![{alt_text}]({img_rel_path})"
             md_content = md_content.replace(target, target + comment, 1)
 
@@ -203,7 +204,7 @@ def extract_from_pdf(
     ollama_retries=2,
 ):
     """
-    Extracts text, images, and tables from a single PDF document using 
+    Extracts text, images, and tables from a single PDF document using
     advanced PyMuPDF features (pymupdf4llm and layout analysis).
 
     Args:
@@ -218,7 +219,7 @@ def extract_from_pdf(
     pdf_path = Path(pdf_path).absolute()
     output_path = Path(output_path).absolute()
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     base_name = pdf_path.stem
     out_img_dir_name = f"{base_name}_images"
     out_tab_path = output_path / f"{base_name}_tables"
@@ -226,21 +227,21 @@ def extract_from_pdf(
 
     # 1. Advanced Layout-Aware Text/Markdown Extraction with Images
     print(f"Extracting layout-aware markdown and images from: {pdf_path}")
-    
-    # We change directory to output_path so that pymupdf4llm saves images 
+
+    # We change directory to output_path so that pymupdf4llm saves images
     # with relative paths in the markdown content.
     original_cwd = os.getcwd()
     try:
         os.chdir(output_path)
         md_text = pymupdf4llm.to_markdown(
-            str(pdf_path), 
-            write_images=True, 
+            str(pdf_path),
+            write_images=True,
             image_path=out_img_dir_name,
-            image_format="png"
+            image_format="png",
         )
     finally:
         os.chdir(original_cwd)
-    
+
     # Pre-calculate OCR or Ollama analysis for all images to avoid redundant processing
     image_text_map = {}
     img_regex = r"!\[(.*?)\]\((.*?)\)"
@@ -268,17 +269,13 @@ def extract_from_pdf(
                     )
 
     # Save the Markdown version with invisible comments
-    md_with_text = process_image_text_for_md(
-        md_text, output_path, image_text_map, mode
-    )
+    md_with_text = process_image_text_for_md(md_text, output_path, image_text_map, mode)
     with open(output_path / f"{base_name}.md", "w", encoding="utf-8") as f:
         f.write(md_with_text)
 
     # Save the .txt version with extracted image text in place
     print("Generating the text version...")
-    txt_text = process_image_text_for_txt(
-        md_text, output_path, image_text_map, mode
-    )
+    txt_text = process_image_text_for_txt(md_text, output_path, image_text_map, mode)
     with open(output_path / f"{base_name}.txt", "w", encoding="utf-8") as f:
         f.write(txt_text)
 
@@ -299,7 +296,12 @@ def extract_from_pdf(
         tabs = page.find_tables()
         for tab_index, tab in enumerate(tabs):
             table_data = tab.extract()
-            with open(out_tab_path / f"page_{i}_table_{tab_index}.csv", "w", newline="", encoding="utf-8") as csvfile:
+            with open(
+                out_tab_path / f"page_{i}_table_{tab_index}.csv",
+                "w",
+                newline="",
+                encoding="utf-8",
+            ) as csvfile:
                 writer = csv.writer(csvfile)
                 writer.writerows(table_data)
 
@@ -356,7 +358,7 @@ def parse_arguments():
 
 if __name__ == "__main__":
     args = parse_arguments()
-    
+
     if not os.path.exists(args.file_path):
         print(f"Error: PDF file not found at '{args.file_path}'")
         exit(1)
