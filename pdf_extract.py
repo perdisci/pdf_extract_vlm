@@ -20,6 +20,7 @@ import pymupdf.layout
 import pymupdf
 import pymupdf4llm
 from pathlib import Path
+import imagehash
 
 import pytesseract
 from PIL import Image
@@ -30,6 +31,65 @@ from ollama import Client
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+class ImageAnalysisCache:
+    def __init__(self, cache_file=".image_analysis_cache.json", threshold=0):
+        self.cache_file = Path(cache_file)
+        self.threshold = threshold
+        self.cache = []  # List of dicts: {"hash": str, "results": dict}
+        self.load()
+
+    def load(self):
+        if self.cache_file.exists():
+            try:
+                with open(self.cache_file, "r") as f:
+                    self.cache = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load cache: {e}")
+
+    def save(self):
+        try:
+            with open(self.cache_file, "w") as f:
+                json.dump(self.cache, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save cache: {e}")
+
+    def get_phash(self, image_path):
+        """Computes the perceptual hash (pHash) for the image."""
+        try:
+            with Image.open(image_path) as img:
+                return imagehash.phash(img)
+        except Exception as e:
+            logger.error(f"Failed to compute pHash for {image_path}: {e}")
+            return None
+
+    def find_match(self, current_hash, key):
+        if current_hash is None:
+            return None
+        for entry in self.cache:
+            stored_hash = imagehash.hex_to_hash(entry["hash"])
+            distance = current_hash - stored_hash
+            if distance <= self.threshold:
+                return {"value": entry["results"].get(key), "distance": distance}
+        return None
+
+    def update(self, current_hash, key, value):
+        if current_hash is None or value is None:
+            return
+
+        hash_str = str(current_hash)
+        # Try to find an existing entry within the threshold to update
+        for entry in self.cache:
+            stored_hash = imagehash.hex_to_hash(entry["hash"])
+            if (current_hash - stored_hash) <= self.threshold:
+                entry["results"][key] = value
+                self.save()
+                return
+
+        # No existing entry found, add a new one
+        self.cache.append({"hash": hash_str, "results": {key: value}})
+        self.save()
 
 
 class HybridOCR:
@@ -97,6 +157,8 @@ class HybridOCR:
 
 # Initialize HybridOCR engine once
 hybrid_ocr = HybridOCR()
+# Initialize Image Analysis Cache
+image_cache = ImageAnalysisCache()
 
 
 def extract_ocr_from_image_file(image_path):
@@ -255,30 +317,42 @@ def extract_from_pdf(
         if img_rel_path not in image_text_map:
             full_path = output_path / img_rel_path
             if full_path.exists():
+                # Check cache first
+                phash = image_cache.get_phash(full_path)
+                cached_result = image_cache.find_match(phash, mode)
+                if cached_result:
+                    logger.info(
+                        f"Cache hit for {img_rel_path} (mode: {mode}, distance: {cached_result['distance']})"
+                    )
+                    image_text_map[img_rel_path] = cached_result["value"]
+                    continue
+
                 if mode == "ollama":
                     logger.info(f"Querying Ollama ({model}) for {img_rel_path}...")
                     start_time = time.time()
-                    image_text_map[img_rel_path] = extract_ollama_from_image_file(
+                    result = extract_ollama_from_image_file(
                         full_path, model, ollama_host, ollama_timeout, ollama_retries
                     )
+                    image_text_map[img_rel_path] = result
                     elapsed_time = time.time() - start_time
-                    if image_text_map[img_rel_path] is not None:
+                    if result is not None:
                         logger.info(
                             f"Ollama query successful for {img_rel_path}; done in {elapsed_time:.2f}s"
                         )
+                        image_cache.update(phash, "ollama", result)
                     else:
                         # Fallback to OCR if Ollama failed after all retries
                         logger.warning(
                             f"Ollama failed for {img_rel_path}. Falling back to OCR..."
                         )
-                        image_text_map[img_rel_path] = extract_ocr_from_image_file(
-                            full_path
-                        )
+                        result = extract_ocr_from_image_file(full_path)
+                        image_text_map[img_rel_path] = result
+                        image_cache.update(phash, "ocr", result)
                 else:
                     logger.info(f"Performing OCR on {img_rel_path}...")
-                    image_text_map[img_rel_path] = extract_ocr_from_image_file(
-                        full_path
-                    )
+                    result = extract_ocr_from_image_file(full_path)
+                    image_text_map[img_rel_path] = result
+                    image_cache.update(phash, "ocr", result)
 
     # Save the Markdown version with invisible comments
     md_with_text = process_image_text_for_md(md_text, output_path, image_text_map, mode)
