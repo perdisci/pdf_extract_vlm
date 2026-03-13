@@ -15,6 +15,7 @@ import json
 import argparse
 import re
 import time
+import logging
 import pymupdf.layout
 import pymupdf
 import pymupdf4llm
@@ -25,6 +26,10 @@ from PIL import Image
 from rapidocr import RapidOCR
 from rapidocr.utils.typings import LangRec
 from ollama import Client
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 
 class HybridOCR:
@@ -137,13 +142,13 @@ def extract_ollama_from_image_file(image_path, model, host, timeout, retries=2):
             return response["response"]
         except Exception as e:
             if attempt < retries:
-                print(
-                    f"\nWarning: Ollama query failed for {image_path.name} (attempt {attempt + 1}/{retries + 1}): {e}. Retrying in 2s..."
+                logger.warning(
+                    f"Ollama query failed for {image_path.name} (attempt {attempt + 1}/{retries + 1}): {e}. Retrying in 2s..."
                 )
                 time.sleep(2)
             else:
-                print(
-                    f"\nError: Ollama query failed after {retries + 1} attempts for {image_path.name}: {e}"
+                logger.error(
+                    f"Ollama query failed after {retries + 1} attempts for {image_path.name}: {e}"
                 )
                 return None
 
@@ -226,7 +231,7 @@ def extract_from_pdf(
     out_tab_path.mkdir(exist_ok=True)
 
     # 1. Advanced Layout-Aware Text/Markdown Extraction with Images
-    print(f"Extracting layout-aware markdown and images from: {pdf_path}")
+    logger.info(f"Extracting layout-aware markdown and images from: {pdf_path}")
 
     # We change directory to output_path so that pymupdf4llm saves images
     # with relative paths in the markdown content.
@@ -251,19 +256,26 @@ def extract_from_pdf(
             full_path = output_path / img_rel_path
             if full_path.exists():
                 if mode == "ollama":
-                    print(
-                        f"Querying Ollama ({model}) for {img_rel_path}...",
-                        end=" ",
-                        flush=True,
-                    )
+                    logger.info(f"Querying Ollama ({model}) for {img_rel_path}...")
                     start_time = time.time()
                     image_text_map[img_rel_path] = extract_ollama_from_image_file(
                         full_path, model, ollama_host, ollama_timeout, ollama_retries
                     )
                     elapsed_time = time.time() - start_time
-                    print(f"done in {elapsed_time:.2f}s")
+                    if image_text_map[img_rel_path] is not None:
+                        logger.info(
+                            f"Ollama query successful for {img_rel_path}; done in {elapsed_time:.2f}s"
+                        )
+                    else:
+                        # Fallback to OCR if Ollama failed after all retries
+                        logger.warning(
+                            f"Ollama failed for {img_rel_path}. Falling back to OCR..."
+                        )
+                        image_text_map[img_rel_path] = extract_ocr_from_image_file(
+                            full_path
+                        )
                 else:
-                    print(f"Performing OCR on {img_rel_path}...")
+                    logger.info(f"Performing OCR on {img_rel_path}...")
                     image_text_map[img_rel_path] = extract_ocr_from_image_file(
                         full_path
                     )
@@ -274,7 +286,7 @@ def extract_from_pdf(
         f.write(md_with_text)
 
     # Save the .txt version with extracted image text in place
-    print("Generating the text version...")
+    logger.info("Generating the text version...")
     txt_text = process_image_text_for_txt(md_text, output_path, image_text_map, mode)
     with open(output_path / f"{base_name}.txt", "w", encoding="utf-8") as f:
         f.write(txt_text)
@@ -291,7 +303,7 @@ def extract_from_pdf(
         json.dump(doc_json, f, indent=2)
 
     # 4. Extract and save tables as CSV
-    print("Extracting tables...")
+    logger.info("Extracting tables...")
     for i, page in enumerate(doc):
         tabs = page.find_tables()
         for tab_index, tab in enumerate(tabs):
@@ -305,7 +317,7 @@ def extract_from_pdf(
                 writer = csv.writer(csvfile)
                 writer.writerows(table_data)
 
-    print(f"Extraction complete. Results saved in: {output_path}")
+    logger.info(f"Extraction complete. Results saved in: {output_path}")
 
 
 def parse_arguments():
@@ -360,7 +372,7 @@ if __name__ == "__main__":
     args = parse_arguments()
 
     if not os.path.exists(args.file_path):
-        print(f"Error: PDF file not found at '{args.file_path}'")
+        logger.error(f"PDF file not found at '{args.file_path}'")
         exit(1)
 
     extract_from_pdf(
